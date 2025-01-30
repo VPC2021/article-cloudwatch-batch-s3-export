@@ -1,0 +1,800 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'CloudFormation template for CloudWatch Logs to S3 export solution'
+
+Parameters:
+  NotificationEmail:
+    Type: String
+    Description: Email address to receive notifications
+  
+  ChunkDays:
+    Type: Number
+    Description: Number of days per export chunk
+    MinValue: 1
+    MaxValue: 30
+
+  BucketName:
+    Type: String
+    Description: Name of the S3 bucket to store exported logs
+
+  GlacierTransitionDays:
+    Type: Number
+    Description: Number of days after which objects transition to Glacier
+
+  ExportTagKey:
+    Type: String
+    Description: Tag key to identify log groups for export
+    
+  ExportTagValue:
+    Type: String
+    Description: Tag value to identify log groups for export
+
+  ScheduleExpression:
+    Type: String
+    Description: Schedule expression for the export task
+
+Resources:
+  ExportBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    Properties:
+      BucketName: !Ref BucketName
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: GlacierTransition
+            Status: Enabled
+            Transitions:
+              - TransitionInDays: !Ref GlacierTransitionDays
+                StorageClass: GLACIER
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+
+  ExportBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref ExportBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowCloudWatchLogsExport
+            Effect: Allow
+            Principal:
+              Service: logs.amazonaws.com
+            Action:
+              - s3:GetBucketAcl
+            Resource: !GetAtt ExportBucket.Arn
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+              ArnLike:
+                aws:SourceArn: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:*'
+          - Sid: AllowCloudWatchLogsPutObject
+            Effect: Allow
+            Principal:
+              Service: logs.amazonaws.com
+            Action:
+              - s3:PutObject
+            Resource: !Sub '${ExportBucket.Arn}/*'
+            Condition:
+              StringEquals:
+                s3:x-amz-acl: bucket-owner-full-control
+                aws:SourceAccount: !Ref AWS::AccountId
+              ArnLike:
+                aws:SourceArn: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:*'
+
+  LogExporterSNSTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${AWS::StackName}-notifications'
+      Subscription:
+        - Protocol: email
+          Endpoint: !Ref NotificationEmail
+
+  LogExporterRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: LogExporterPermissions
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateExportTask
+                  - logs:DescribeExportTasks
+                  - logs:DescribeLogGroups
+                  - logs:ListTagsLogGroup
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*'
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                Resource: !Sub '${ExportBucket.Arn}/*'
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref LogExporterSNSTopic
+              - Effect: Allow
+                Action:
+                  - ssm:PutParameter
+                  - ssm:GetParameter
+                  - ssm:DeleteParameter
+                Resource: !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/log-exporter/*'
+
+  LogExporterFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-exporter'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Timeout: 900
+      MemorySize: 2048
+      Role: !GetAtt LogExporterRole.Arn
+      Environment:
+        Variables:
+          DESTINATION_BUCKET: !Ref ExportBucket
+          SNS_TOPIC_ARN: !Ref LogExporterSNSTopic
+          CHUNK_DAYS: !Ref ChunkDays
+          MAX_CONCURRENT_EXPORTS: '3'
+          ADAPTIVE_CHUNK_SIZE: 'true'
+      Code:
+        ZipFile: |
+          import boto3
+          import time
+          from datetime import datetime, timezone, timedelta
+          import logging
+          import json
+          from botocore.exceptions import ClientError
+          from botocore.config import Config
+          import os
+          import random
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          
+          # Initialize AWS clients with retry configuration
+          retry_config = Config(
+              retries = dict(
+                  max_attempts = 10,
+                  mode = 'adaptive'
+              )
+          )
+
+          logs_client = boto3.client('logs', config=retry_config)
+          ssm_client = boto3.client('ssm', config=retry_config)
+          sns_client = boto3.client('sns', config=retry_config)
+
+          def exponential_backoff(attempt, max_delay=32):
+              """Calculate exponential backoff with jitter"""
+              delay = min(max_delay, pow(2, attempt))
+              jitter = random.uniform(0, 0.1 * delay)
+              return delay + jitter
+
+          class LogExporter:
+              def __init__(self, destination_bucket, sns_topic_arn, export_tag_key, export_tag_value, chunk_days=7):
+                  self.destination_bucket = destination_bucket
+                  self.sns_topic_arn = sns_topic_arn
+                  self.export_tag_key = export_tag_key
+                  self.export_tag_value = export_tag_value
+                  self.chunk_days = chunk_days
+                  self.max_wait_time = 43200  # 12 hours in seconds
+                  self.max_retries = 10
+                  self.current_task_start_time = None
+
+              def format_bytes(self, size):
+                  """Convert bytes to human readable format"""
+                  for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
+                      if size < 1024.0:
+                          return f"{size:.2f} {unit}"
+                      size /= 1024.0
+
+              def calculate_time_remaining(self, progress_percentage, elapsed_time):
+                  """Estimate remaining time based on current progress"""
+                  if progress_percentage <= 0:
+                      return "Calculating..."
+                  
+                  elapsed_seconds = time.time() - self.current_task_start_time
+                  total_estimated_seconds = (elapsed_seconds * 100) / progress_percentage
+                  remaining_seconds = total_estimated_seconds - elapsed_seconds
+                  
+                  if remaining_seconds < 60:
+                      return f"{int(remaining_seconds)} seconds"
+                  elif remaining_seconds < 3600:
+                      return f"{int(remaining_seconds/60)} minutes"
+                  else:
+                      return f"{remaining_seconds/3600:.1f} hours"
+
+              def exponential_backoff(self, attempt, max_delay=32):
+                  """Calculate exponential backoff with jitter"""
+                  delay = min(max_delay, pow(2, attempt))
+                  jitter = random.uniform(0, 0.1 * delay)
+                  return delay + jitter
+
+              def retry_with_backoff(self, func, *args, **kwargs):
+                  """Generic retry function with exponential backoff"""
+                  for attempt in range(self.max_retries):
+                      try:
+                          return func(*args, **kwargs)
+                      except ClientError as e:
+                          if e.response['Error']['Code'] in ['ThrottlingException', 'TooManyRequestsException']:
+                              if attempt == self.max_retries - 1:
+                                  raise  # Re-raise the exception if we've exhausted all retries
+                              
+                              delay = self.exponential_backoff(attempt)
+                              logger.warning(f"Request throttled, retrying in {delay:.2f} seconds (attempt {attempt + 1}/{self.max_retries})")
+                              time.sleep(delay)
+                          else:
+                              raise
+
+              def calculate_optimal_chunk_size(self, log_group_name):
+                  """Calculate optimal chunk size based on log volume"""
+                  try:
+                      response = logs_client.describe_log_groups(
+                          logGroupNamePrefix=log_group_name,
+                          limit=1
+                      )
+                      stored_bytes = response['logGroups'][0].get('storedBytes', 0)
+                      
+                      logger.info(f"Log group {log_group_name} size: {stored_bytes/1_000_000_000:.2f} GB")
+                      
+                      # Adjust chunk days based on volume
+                      if stored_bytes > 10_000_000_000:  # 10 GB
+                          optimal_days = 3  # 3 days for large log groups
+                      elif stored_bytes > 5_000_000_000:  # 5 GB
+                          optimal_days = 5  # 5 days for medium log groups
+                      else:
+                          optimal_days = 7  # 7 days for small log groups
+                      
+                      logger.info(f"Using {optimal_days} days chunk size for {log_group_name}")
+                      return optimal_days
+                          
+                  except Exception as e:
+                      logger.warning(f"Error calculating chunk size: {str(e)}, using default {self.chunk_days} days")
+                      return self.chunk_days  # Return default chunk size
+
+              def send_sns_notification(self, subject, message):
+                  """Send SNS notification for status updates and errors"""
+                  try:
+                      sns_client.publish(
+                          TopicArn=self.sns_topic_arn,
+                          Subject=subject,
+                          Message=message
+                      )
+                  except Exception as e:
+                      logger.error(f"Failed to send SNS notification: {str(e)}")
+              
+              def get_log_group_tags(self, log_group_name):
+                  """Get tags for a log group with retry logic"""
+                  def get_tags():
+                      return logs_client.list_tags_log_group(logGroupName=log_group_name)
+                  
+                  try:
+                      response = self.retry_with_backoff(get_tags)
+                      return response.get('tags', {})
+                  except Exception as e:
+                      logger.error(f"Error getting tags for log group {log_group_name}: {str(e)}")
+                      return {}
+
+              def get_tagged_log_groups(self):
+                  """Get all log groups with specified tag (with retry logic)"""
+                  tagged_groups = []
+                  next_token = None
+                  
+                  while True:
+                      try:
+                          if next_token:
+                              response = self.retry_with_backoff(
+                                  logs_client.describe_log_groups,
+                                  nextToken=next_token
+                              )
+                          else:
+                              response = self.retry_with_backoff(
+                                  logs_client.describe_log_groups
+                              )
+                          
+                          for log_group in response.get('logGroups', []):
+                              log_group_name = log_group['logGroupName']
+                              tags = self.get_log_group_tags(log_group_name)
+                              
+                              if tags.get(self.export_tag_key) == self.export_tag_value:
+                                  logger.info(f"Found tagged log group: {log_group_name}")
+                                  tagged_groups.append(log_group_name)
+                          
+                          next_token = response.get('nextToken')
+                          if not next_token:
+                              break
+                              
+                      except Exception as e:
+                          logger.error(f"Error listing log groups: {str(e)}")
+                          break
+                  
+                  return tagged_groups
+
+              def get_ssm_parameter_name(self, log_group_name, param_type='last-export'):
+                  """Generate SSM parameter name for different tracking purposes"""
+                  sanitized_name = log_group_name.lstrip('/').replace('/', '-')
+                  return f"/log-exporter/{sanitized_name}/{param_type}"
+
+              def store_export_progress(self, log_group_name, progress_data):
+                  """Store export progress in SSM Parameter Store"""
+                  try:
+                      parameter_name = self.get_ssm_parameter_name(log_group_name, 'progress')
+                      ssm_client.put_parameter(
+                          Name=parameter_name,
+                          Value=json.dumps(progress_data),
+                          Type='String',
+                          Overwrite=True
+                      )
+                      logger.info(f"Stored progress data for {log_group_name}")
+                  except Exception as e:
+                      logger.error(f"Error storing progress data: {str(e)}")
+
+              def get_export_progress(self, log_group_name):
+                  """Retrieve export progress from SSM Parameter Store"""
+                  try:
+                      parameter_name = self.get_ssm_parameter_name(log_group_name, 'progress')
+                      response = ssm_client.get_parameter(Name=parameter_name)
+                      return json.loads(response['Parameter']['Value'])
+                  except ClientError as e:
+                      if e.response['Error']['Code'] == 'ParameterNotFound':
+                          return None
+                      raise
+                  except Exception as e:
+                      logger.error(f"Error retrieving progress data: {str(e)}")
+                      return None
+
+              def update_export_status(self, log_group_name, task_id, status, current_chunk, total_chunks):
+                  """Update export status in SSM Parameter Store with enhanced progress tracking"""
+                  try:
+                      if self.current_task_start_time is None:
+                          self.current_task_start_time = time.time()
+
+                      elapsed_time = time.time() - self.current_task_start_time
+                      percentage = (current_chunk / total_chunks) * 100
+                      
+                      progress_data = {
+                          'taskId': task_id,
+                          'status': status,
+                          'currentChunk': current_chunk,
+                          'totalChunks': total_chunks,
+                          'lastUpdated': int(time.time() * 1000),
+                          'percentage': percentage,
+                          'elapsedTime': elapsed_time,
+                          'estimatedTimeRemaining': self.calculate_time_remaining(percentage, elapsed_time)
+                      }
+                      
+                      self.store_export_progress(log_group_name, progress_data)
+                      
+                      # Enhanced progress logging
+                      progress_message = (
+                          f"\nExport Progress for {log_group_name}:\n"
+                          f"├─ Status: {status}\n"
+                          f"├─ Progress: {percentage:.1f}% ({current_chunk}/{total_chunks} chunks)\n"
+                          f"├─ Elapsed Time: {int(elapsed_time/60)} minutes {int(elapsed_time%60)} seconds\n"
+                          f"└─ Estimated Time Remaining: {progress_data['estimatedTimeRemaining']}"
+                      )
+                      
+                      logger.info(progress_message)
+                      
+                      # Send notification at 25% intervals or completion
+                      if percentage % 25 < 1 or status == 'COMPLETED':
+                          self.send_sns_notification(
+                              f"Log Export Progress - {log_group_name}",
+                              progress_message
+                          )
+                          
+                  except Exception as e:
+                      logger.error(f"Error updating export status: {str(e)}")
+
+              def get_last_export_time(self, ssm_parameter_name):
+                  """Retrieve last export timestamp from SSM Parameter Store"""
+                  try:
+                      response = ssm_client.get_parameter(Name=ssm_parameter_name)
+                      return int(response['Parameter']['Value'])
+                  except ClientError as e:
+                      if e.response['Error']['Code'] == 'ParameterNotFound':
+                          return None
+                      raise
+
+              def update_last_export_time(self, ssm_parameter_name, timestamp):
+                  """Update last export timestamp in SSM Parameter Store"""
+                  try:
+                      ssm_client.put_parameter(
+                          Name=ssm_parameter_name,
+                          Value=str(timestamp),
+                          Type='String',
+                          Overwrite=True
+                      )
+                  except Exception as e:
+                      logger.error(f"Failed to update SSM parameter: {str(e)}")
+                      raise
+
+              def wait_for_export_task(self, task_id, log_group_name, current_chunk, total_chunks):
+                  """Wait for export task completion with enhanced progress tracking"""
+                  start_time = time.time()
+                  last_log_time = start_time
+                  last_status = None
+                  
+                  while True:
+                      try:
+                          if (time.time() - start_time) > self.max_wait_time:
+                              self.update_export_status(log_group_name, task_id, 'TIMEOUT', current_chunk, total_chunks)
+                              raise TimeoutError(f"Export task {task_id} exceeded maximum wait time of 12 hours")
+
+                          response = self.check_export_task_status(task_id)
+                          task = response['exportTasks'][0]
+                          status = task['status']['code']
+                          
+                          # Only update status if it changed or 5 minutes passed
+                          current_time = time.time()
+                          if status != last_status or (current_time - last_log_time) >= 300:
+                              self.update_export_status(log_group_name, task_id, status, current_chunk, total_chunks)
+                              last_status = status
+                              last_log_time = current_time
+                          
+                          if status == 'COMPLETED':
+                              logger.info(f"Export task {task_id} completed successfully")
+                              return True
+                          elif status in ['FAILED', 'CANCELLED']:
+                              error_message = task['status'].get('message', 'No error message provided')
+                              logger.error(f"Export task {task_id} failed: {error_message}")
+                              return False
+                          
+                          time.sleep(60)  # Check every minute
+                          
+                      except Exception as e:
+                          logger.error(f"Error checking task status: {str(e)}")
+                          time.sleep(60)  # Wait before retrying
+
+              def create_export_task(self, log_group_name, from_time, to_time):
+                  """Create export task with retry logic"""
+                  def create_task():
+                      return logs_client.create_export_task(
+                          logGroupName=log_group_name,
+                          fromTime=from_time,
+                          to=to_time,
+                          destination=self.destination_bucket,
+                          destinationPrefix=f"{log_group_name.strip('/')}/{datetime.fromtimestamp(from_time/1000).strftime('%Y/%m/%d')}"
+                      )
+                  
+                  try:
+                      return self.retry_with_backoff(create_task)
+                  except Exception as e:
+                      logger.error(f"Error creating export task: {str(e)}")
+                      raise
+
+              def check_export_task_status(self, task_id):
+                  """Check export task status with retry logic"""
+                  def check_status():
+                      return logs_client.describe_export_tasks(taskId=task_id)
+                  
+                  try:
+                      return self.retry_with_backoff(check_status)
+                  except Exception as e:
+                      logger.error(f"Error checking export task status: {str(e)}")
+                      raise
+
+              def check_existing_export_tasks(self):
+                  """Check for any existing export tasks"""
+                  try:
+                      response = logs_client.describe_export_tasks()
+                      active_tasks = [task for task in response.get('exportTasks', []) 
+                                    if task['status']['code'] == 'PENDING' or 
+                                      task['status']['code'] == 'RUNNING']
+                      return len(active_tasks) > 0
+                  except Exception as e:
+                      logger.error(f"Error checking existing export tasks: {str(e)}")
+                      return False
+
+              def export_log_group(self, log_group_name):
+                  """Export a single log group with progress tracking"""
+                  try:
+                      # Reset task start time for new export
+                      self.current_task_start_time = None
+
+                      if self.check_existing_export_tasks():
+                          message = f"Skipping export for {log_group_name} - another export task is already running"
+                          logger.warning(message)
+                          self.send_sns_notification(
+                              f"Log Export Skipped - {log_group_name}",
+                              message
+                          )
+                          return False
+
+                      # Get last export time
+                      last_export_param = self.get_ssm_parameter_name(log_group_name, 'last-export')
+                      try:
+                          response = ssm_client.get_parameter(Name=last_export_param)
+                          last_export_time = int(response['Parameter']['Value'])
+                      except ClientError as e:
+                          if e.response['Error']['Code'] == 'ParameterNotFound':
+                              # Get log group creation time if no last export
+                              response = logs_client.describe_log_groups(
+                                  logGroupNamePrefix=log_group_name,
+                                  limit=1
+                              )
+                              last_export_time = response['logGroups'][0]['creationTime']
+                          else:
+                              raise
+
+                      current_time = int(time.time() * 1000)
+                      chunk_size = self.chunk_days * 24 * 60 * 60 * 1000
+                      total_chunks = ((current_time - last_export_time) // chunk_size) + 1
+
+                      logger.info(f"Starting export for {log_group_name}")
+                      logger.info(f"Time range: {datetime.fromtimestamp(last_export_time/1000)} to "
+                                f"{datetime.fromtimestamp(current_time/1000)}")
+                      logger.info(f"Total chunks to process: {total_chunks}")
+
+                      # Initialize progress
+                      self.store_export_progress(log_group_name, {
+                          'status': 'STARTING',
+                          'currentChunk': 0,
+                          'totalChunks': total_chunks,
+                          'startTime': last_export_time,
+                          'endTime': current_time,
+                          'lastUpdated': int(time.time() * 1000)
+                      })
+
+                      start_time = last_export_time
+                      chunks_processed = 0
+                      
+                      while start_time < current_time:
+                          end_time = min(start_time + chunk_size, current_time)
+                          chunks_processed += 1
+                          
+                          logger.info(f"Processing chunk {chunks_processed}/{total_chunks}")
+                          logger.info(f"Time range: {datetime.fromtimestamp(start_time/1000)} to "
+                                    f"{datetime.fromtimestamp(end_time/1000)}")
+
+                          task_response = logs_client.create_export_task(
+                              logGroupName=log_group_name,
+                              fromTime=start_time,
+                              to=end_time,
+                              destination=self.destination_bucket,
+                              destinationPrefix=f"{log_group_name.strip('/')}/{datetime.fromtimestamp(start_time/1000).strftime('%Y/%m/%d')}"
+                          )
+                          
+                          task_id = task_response['taskId']
+                          
+                          if not self.wait_for_export_task(task_id, log_group_name, chunks_processed, total_chunks):
+                              raise Exception(f"Failed to export chunk {chunks_processed}")
+
+                          # Update last export time
+                          ssm_client.put_parameter(
+                              Name=last_export_param,
+                              Value=str(end_time),
+                              Type='String',
+                              Overwrite=True
+                          )
+                          
+                          start_time = end_time
+
+                      # Final progress update
+                      self.store_export_progress(log_group_name, {
+                          'status': 'COMPLETED',
+                          'currentChunk': total_chunks,
+                          'totalChunks': total_chunks,
+                          'startTime': last_export_time,
+                          'endTime': current_time,
+                          'lastUpdated': int(time.time() * 1000),
+                          'percentage': 100
+                      })
+
+                      # Add summary at completion
+                      total_time = time.time() - self.current_task_start_time
+                      summary_message = (
+                          f"\nExport Summary for {log_group_name}:\n"
+                          f"├─ Total Chunks Processed: {chunks_processed}\n"
+                          f"├─ Time Range: {datetime.fromtimestamp(last_export_time/1000)} to "
+                          f"{datetime.fromtimestamp(current_time/1000)}\n"
+                          f"├─ Total Duration: {int(total_time/60)} minutes {int(total_time%60)} seconds\n"
+                          f"└─ Average Time per Chunk: {(total_time/chunks_processed/60):.1f} minutes"
+                      )
+                      
+                      logger.info(summary_message)
+                      self.send_sns_notification(
+                          f"Log Export Complete - {log_group_name}",
+                          summary_message
+                      )
+                      
+                      return True
+
+                  except Exception as e:
+                      error_msg = f"Log export failed for {log_group_name}: {str(e)}"
+                      logger.error(error_msg)
+                      self.send_sns_notification(
+                          f"Log Export Failed - {log_group_name}",
+                          error_msg
+                      )
+                      return False
+                      
+                      # Update progress with error status
+                      self.store_export_progress(log_group_name, {
+                          'status': 'FAILED',
+                          'error': str(e),
+                          'currentChunk': chunks_processed,
+                          'totalChunks': total_chunks,
+                          'lastUpdated': int(time.time() * 1000)
+                      })
+                      
+                      self.send_sns_notification(
+                          f"Log Export Failed - {log_group_name}",
+                          error_msg
+                      )
+                      return False
+
+              def get_export_summary(self, log_group_name):
+                  """Get summary of export progress"""
+                  progress_data = self.get_export_progress(log_group_name)
+                  if not progress_data:
+                      return "No export data available"
+                      
+                  status = progress_data['status']
+                  percentage = progress_data.get('percentage', 0)
+                  current_chunk = progress_data.get('currentChunk', 0)
+                  total_chunks = progress_data.get('totalChunks', 0)
+                  
+                  return (f"Export Status: {status}\n"
+                          f"Progress: {percentage:.2f}%\n"
+                          f"Chunks Processed: {current_chunk}/{total_chunks}")
+
+              def export_all_tagged_logs(self):
+                  """Main function to export all tagged log groups"""
+                  tagged_groups = self.get_tagged_log_groups()
+                  
+                  if not tagged_groups:
+                      logger.info(f"No log groups found with tag {self.export_tag_key}={self.export_tag_value}")
+                      return
+                  
+                  success_count = 0
+                  failure_count = 0
+                  
+                  # Use ThreadPoolExecutor for parallel processing
+                  with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
+                      # Submit all export tasks
+                      future_to_loggroup = {
+                          executor.submit(self.export_log_group, log_group_name): log_group_name 
+                          for log_group_name in tagged_groups
+                      }
+                      
+                      # Process completed tasks
+                      for future in concurrent.futures.as_completed(future_to_loggroup):
+                          log_group_name = future_to_loggroup[future]
+                          try:
+                              if future.result():
+                                  success_count += 1
+                              else:
+                                  failure_count += 1
+                          except Exception as e:
+                              logger.error(f"Export failed for {log_group_name}: {str(e)}")
+                              failure_count += 1
+                  
+                  # Send summary notification
+                  summary_message = (
+                      f"Log Export Summary:\n"
+                      f"Total log groups processed: {len(tagged_groups)}\n"
+                      f"Successful exports: {success_count}\n"
+                      f"Failed exports: {failure_count}"
+                  )
+                  self.send_sns_notification(
+                      "Log Export Summary",
+                      summary_message
+                  )
+
+          def lambda_handler(event, context):
+              """AWS Lambda handler with SSM-based progress tracking"""
+              try:
+                  destination_bucket = event['destination_bucket']
+                  sns_topic_arn = event['sns_topic_arn']
+                  export_tag_key = event.get('export_tag_key', 'ExportToS3')
+                  export_tag_value = event.get('export_tag_value', 'true')
+                  chunk_days = event.get('chunk_days', 7)
+
+                  exporter = LogExporter(
+                      destination_bucket,
+                      sns_topic_arn,
+                      export_tag_key,
+                      export_tag_value,
+                      chunk_days
+                  )
+                  
+                  tagged_groups = exporter.get_tagged_log_groups()
+                  
+                  if not tagged_groups:
+                      logger.info(f"No log groups found with tag {export_tag_key}={export_tag_value}")
+                      return {
+                          'statusCode': 200,
+                          'body': 'No tagged log groups found'
+                      }
+                  
+                  results = {}
+                  for log_group_name in tagged_groups:
+                      success = exporter.export_log_group(log_group_name)
+                      results[log_group_name] = {
+                          'success': success,
+                          'summary': exporter.get_export_summary(log_group_name)
+                      }
+
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'message': 'Export process completed',
+                          'results': results
+                      })
+                  }
+                  
+              except Exception as e:
+                  error_msg = f"Export process failed: {str(e)}"
+                  logger.error(error_msg)
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({'error': error_msg})
+                  }
+
+
+  LogExporterLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${LogExporterFunction}'
+
+  ExporterScheduleRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${AWS::StackName}-schedule'
+      Description: 'Schedule for CloudWatch Logs export to S3'
+      ScheduleExpression: !Ref ScheduleExpression
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt LogExporterFunction.Arn
+          Id: 'LogExporterSchedule'
+          Input: !Sub |
+            {
+              "destination_bucket": "${ExportBucket}",
+              "sns_topic_arn": "${LogExporterSNSTopic}",
+              "export_tag_key": "${ExportTagKey}",
+              "export_tag_value": "${ExportTagValue}",
+              "chunk_days": ${ChunkDays}
+            }
+
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref LogExporterFunction
+      Action: 'lambda:InvokeFunction'
+      Principal: 'events.amazonaws.com'
+      SourceArn: !GetAtt ExporterScheduleRule.Arn
+
+Outputs:
+  ExportBucketName:
+    Description: 'Name of the S3 bucket storing exported logs'
+    Value: !Ref ExportBucket
+
+  SNSTopicARN:
+    Description: 'ARN of the SNS topic for notifications'
+    Value: !Ref LogExporterSNSTopic
+
+  LambdaFunctionARN:
+    Description: 'ARN of the Lambda function'
+    Value: !GetAtt LogExporterFunction.Arn
+
+  ScheduleRuleARN:
+    Description: 'ARN of the EventBridge schedule rule'
+    Value: !GetAtt ExporterScheduleRule.Arn
