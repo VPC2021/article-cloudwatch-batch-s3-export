@@ -9,7 +9,6 @@ This automation is discussed in detail in my LinkedIn article: [Automate Exporti
 - Exports CloudWatch log groups to an S3 bucket on demand
 - Automates log archival for compliance and analysis
 - Uses AWS SDK (Boto3) for seamless interaction with AWS services
-- Supports multiple AWS profiles
 
 ## Author
 Joel Gamadia
