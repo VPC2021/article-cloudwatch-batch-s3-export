@@ -36,6 +36,7 @@ Resources:
   ExportBucket:
     Type: AWS::S3::Bucket
     DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
     Properties:
       BucketName: !Ref BucketName
       VersioningConfiguration:
@@ -44,6 +45,8 @@ Resources:
         Rules:
           - Id: GlacierTransition
             Status: Enabled
+            ExpirationInDays: !Ref ObjectDeletionDays
+            NoncurrentVersionExpirationInDays: !Ref ObjectDeletionDays
             Transitions:
               - TransitionInDays: !Ref GlacierTransitionDays
                 StorageClass: GLACIER
@@ -136,7 +139,7 @@ Resources:
                   - ssm:PutParameter
                   - ssm:GetParameter
                   - ssm:DeleteParameter
-                Resource: !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/log-exporter/*'
+                Resource: '*'
 
   LogExporterFunction:
     Type: AWS::Lambda::Function
@@ -152,7 +155,7 @@ Resources:
           DESTINATION_BUCKET: !Ref ExportBucket
           SNS_TOPIC_ARN: !Ref LogExporterSNSTopic
           CHUNK_DAYS: !Ref ChunkDays
-          MAX_CONCURRENT_EXPORTS: '3'
+          MAX_CONCURRENT_EXPORTS: '1'
           ADAPTIVE_CHUNK_SIZE: 'true'
       Code:
         ZipFile: |
@@ -188,7 +191,7 @@ Resources:
               return delay + jitter
 
           class LogExporter:
-              def __init__(self, destination_bucket, sns_topic_arn, export_tag_key, export_tag_value, chunk_days=7):
+              def __init__(self, destination_bucket, sns_topic_arn, export_tag_key, export_tag_value, chunk_days=7, lambda_context=None):
                   self.destination_bucket = destination_bucket
                   self.sns_topic_arn = sns_topic_arn
                   self.export_tag_key = export_tag_key
@@ -197,6 +200,7 @@ Resources:
                   self.max_wait_time = 43200  # 12 hours in seconds
                   self.max_retries = 10
                   self.current_task_start_time = None
+                  self.lambda_context = lambda_context
 
               def format_bytes(self, size):
                   """Convert bytes to human readable format"""
@@ -270,15 +274,35 @@ Resources:
                       return self.chunk_days  # Return default chunk size
 
               def send_sns_notification(self, subject, message):
-                  """Send SNS notification for status updates and errors"""
+                  """Send an SNS notification with enhanced formatting"""
                   try:
+                      if not self.sns_topic_arn:
+                          logger.warning("SNS topic ARN not provided, skipping notification")
+                          return False
+                        
+                      # Add timestamp and environment info to the message
+                      formatted_message = f"""
+              {message}
+
+              ---
+              Timestamp: {datetime.now().isoformat()}
+              Environment: {os.environ.get('AWS_EXECUTION_ENV', 'Unknown')}
+              Region: {os.environ.get('AWS_REGION', 'Unknown')}
+              Lambda Function: {os.environ.get('AWS_LAMBDA_FUNCTION_NAME', 'Unknown')}
+              """
+                    
+                      # Send the notification
                       sns_client.publish(
                           TopicArn=self.sns_topic_arn,
-                          Subject=subject,
-                          Message=message
+                          Subject=subject[:100],  # SNS subject has a 100 character limit
+                          Message=formatted_message
                       )
+                    
+                      logger.info(f"Sent SNS notification: {subject}")
+                      return True
                   except Exception as e:
                       logger.error(f"Failed to send SNS notification: {str(e)}")
+                      return False
               
               def get_log_group_tags(self, log_group_name):
                   """Get tags for a log group with retry logic"""
@@ -404,14 +428,97 @@ Resources:
                       logger.error(f"Error updating export status: {str(e)}")
 
               def get_last_export_time(self, ssm_parameter_name):
-                  """Retrieve last export timestamp from SSM Parameter Store"""
+                  """Get last export timestamp from SSM Parameter Store"""
                   try:
                       response = ssm_client.get_parameter(Name=ssm_parameter_name)
                       return int(response['Parameter']['Value'])
-                  except ClientError as e:
-                      if e.response['Error']['Code'] == 'ParameterNotFound':
-                          return None
+                  except ssm_client.exceptions.ParameterNotFound:
+                      logger.info(f"SSM parameter {ssm_parameter_name} not found, creating with default value")
+                      # Set a default timestamp (e.g., 24 hours ago)
+                      default_timestamp = int((datetime.now() - timedelta(days=1)).timestamp() * 1000)
+                      self.update_last_export_time(ssm_parameter_name, default_timestamp)
+                      return default_timestamp
+                  except Exception as e:
+                      logger.error(f"Error retrieving SSM parameter: {str(e)}")
                       raise
+
+              def check_and_acquire_lock(self, lock_parameter_name):
+                  """Try to acquire a lock using SSM Parameter Store"""
+                  try:
+                      # Try to create a lock parameter with current timestamp
+                      current_time = int(time.time())
+                      expiry_time = current_time + self.max_wait_time  # Lock expires after max_wait_time
+
+                      # Generate a unique ID if lambda_context is not available
+                      request_id = self.lambda_context.aws_request_id if self.lambda_context else f"local-{uuid.uuid4()}"
+                    
+                      try:
+                          # Try to create the parameter if it doesn't exist
+                          ssm_client.put_parameter(
+                              Name=lock_parameter_name,
+                              Value=f"{expiry_time}|{self.lambda_context.aws_request_id}",
+                              Type='String',
+                              Overwrite=False  # Don't overwrite if it exists
+                          )
+                          logger.info(f"Acquired lock {lock_parameter_name}")
+                          return True
+                      except ssm_client.exceptions.ParameterAlreadyExists:
+                          # Parameter exists, check if lock has expired
+                          response = ssm_client.get_parameter(Name=lock_parameter_name)
+                          lock_value = response['Parameter']['Value']
+                          parts = lock_value.split('|')
+                        
+                          if len(parts) == 2:
+                              lock_expiry, lock_owner = int(parts[0]), parts[1]
+                             
+                              if current_time > lock_expiry:
+                                  # Lock has expired, take it over
+                                  logger.info(f"Taking over expired lock {lock_parameter_name} from {lock_owner}")
+                                  ssm_client.put_parameter(
+                                      Name=lock_parameter_name,
+                                      Value=f"{expiry_time}|{self.lambda_context.aws_request_id}",
+                                      Type='String',
+                                      Overwrite=True
+                                  )
+                                  return True
+                              else:
+                                  # Lock is still valid
+                                  logger.info(f"Lock {lock_parameter_name} is held by {lock_owner}, cannot proceed")
+                                  return False
+                          else:
+                              # Invalid lock format, overwrite it
+                              logger.warning(f"Invalid lock format in {lock_parameter_name}, overwriting")
+                              ssm_client.put_parameter(
+                                  Name=lock_parameter_name,
+                                  Value=f"{expiry_time}|{self.lambda_context.aws_request_id}",
+                                  Type='String',
+                                  Overwrite=True
+                              )
+                              return True
+                  except Exception as e:
+                      logger.error(f"Error acquiring lock: {str(e)}")
+                      return False
+
+              def release_lock(self, lock_parameter_name):
+                  """Release the acquired lock"""
+                  try:
+                      response = ssm_client.get_parameter(Name=lock_parameter_name)
+                      lock_value = response['Parameter']['Value']
+                      parts = lock_value.split('|')
+
+                      request_id = self.lambda_context.aws_request_id if self.lambda_context else None
+                      
+                      if len(parts) == 2 and (parts[1] == request_id or request_id is None):
+                          # Only delete if we own the lock
+                          ssm_client.delete_parameter(Name=lock_parameter_name)
+                          logger.info(f"Released lock {lock_parameter_name}")
+                          return True
+                      else:
+                          logger.warning(f"Cannot release lock {lock_parameter_name} as it's owned by another process")
+                          return False
+                  except Exception as e:
+                      logger.error(f"Error releasing lock: {str(e)}")
+                      return False
 
               def update_last_export_time(self, ssm_parameter_name, timestamp):
                   """Update last export timestamp in SSM Parameter Store"""
@@ -422,63 +529,225 @@ Resources:
                           Type='String',
                           Overwrite=True
                       )
+                      logger.info(f"Updated SSM parameter {ssm_parameter_name} with timestamp {timestamp}")
                   except Exception as e:
                       logger.error(f"Failed to update SSM parameter: {str(e)}")
                       raise
+
+              def record_task_execution(self, log_group_name, task_id, from_time, to_time, status):
+                  """Record task execution details in SSM Parameter Store"""
+                  try:
+                      history_param_name = f"/cloudwatch/export-history/{log_group_name.replace('/', '-')}"
+                      
+                      # Get existing history
+                      try:
+                          response = ssm_client.get_parameter(Name=history_param_name)
+                          history = json.loads(response['Parameter']['Value'])
+                      except ssm_client.exceptions.ParameterNotFound:
+                          history = []
+                    
+                      # Add new entry
+                      history.append({
+                          'taskId': task_id,
+                          'fromTime': from_time,
+                          'toTime': to_time,
+                          'fromTimeFormatted': datetime.fromtimestamp(from_time/1000).isoformat(),
+                          'toTimeFormatted': datetime.fromtimestamp(to_time/1000).isoformat(),
+                          'status': status,
+                          'timestamp': int(time.time() * 1000)
+                      })
+                    
+                      # Keep only the last 100 entries
+                      if len(history) > 100:
+                          history = history[-100:]
+                      
+                      # Update parameter
+                      ssm_client.put_parameter(
+                          Name=history_param_name,
+                          Value=json.dumps(history),
+                          Type='String',
+                          Overwrite=True
+                      )
+                    
+                      logger.info(f"Recorded task execution for {log_group_name}, task ID: {task_id}")
+                  except Exception as e:
+                      logger.error(f"Error recording task execution: {str(e)}")
+
+              def verify_task_history(self, log_group_name):
+                  """Verify task history for overlaps"""
+                  try:
+                      history_param_name = f"/cloudwatch/export-history/{log_group_name.replace('/', '-')}"
+                    
+                      try:
+                          response = ssm_client.get_parameter(Name=history_param_name)
+                          history = json.loads(response['Parameter']['Value'])
+                      except ssm_client.exceptions.ParameterNotFound:
+                          logger.info(f"No task history found for {log_group_name}")
+                          return True
+                    
+                      # Sort by fromTime
+                      history.sort(key=lambda x: x['fromTime'])
+                    
+                      # Check for overlaps
+                      overlaps = []
+                      for i in range(len(history) - 1):
+                          current_task = history[i]
+                          next_task = history[i+1]
+                        
+                          if current_task['toTime'] > next_task['fromTime']:
+                              overlaps.append({
+                                  'task1': current_task['taskId'],
+                                  'task2': next_task['taskId'],
+                                  'task1_range': f"{datetime.fromtimestamp(current_task['fromTime']/1000).isoformat()} to {datetime.fromtimestamp(current_task['toTime']/1000).isoformat()}",
+                                  'task2_range': f"{datetime.fromtimestamp(next_task['fromTime']/1000).isoformat()} to {datetime.fromtimestamp(next_task['toTime']/1000).isoformat()}",
+                                  'overlap': f"{datetime.fromtimestamp(next_task['fromTime']/1000).isoformat()} to {datetime.fromtimestamp(current_task['toTime']/1000).isoformat()}",
+                                  'overlap_duration_ms': current_task['toTime'] - next_task['fromTime']
+                              })
+                    
+                      if overlaps:
+                          logger.error(f"Found {len(overlaps)} overlaps in task history for {log_group_name}")
+            
+                          # Format detailed message for logging and notification
+                          detail_message = f"Task Overlaps Detected for Log Group: {log_group_name}\n\n"
+                        
+                          for i, overlap in enumerate(overlaps):
+                              logger.error(f"Overlap between tasks {overlap['task1']} and {overlap['task2']}: {overlap['overlap']}")
+                            
+                              # Add details to notification message
+                              detail_message += f"Overlap #{i+1}:\n"
+                              detail_message += f"├─ Task 1 ID: {overlap['task1']}\n"
+                              detail_message += f"├─ Task 1 Range: {overlap['task1_range']}\n"
+                              detail_message += f"├─ Task 2 ID: {overlap['task2']}\n"
+                              detail_message += f"├─ Task 2 Range: {overlap['task2_range']}\n"
+                              detail_message += f"├─ Overlap Period: {overlap['overlap']}\n"
+                              detail_message += f"└─ Overlap Duration: {overlap['overlap_duration_ms']/1000/60:.2f} minutes\n\n"
+                        
+                          # Add remediation suggestions
+                          detail_message += "Remediation Steps:\n"
+                          detail_message += "1. Check the CloudWatch Logs export task history\n"
+                          detail_message += "2. Verify the SSM Parameter Store values for last export times\n"
+                          detail_message += "3. Consider manually adjusting the last export time parameter\n"
+                          detail_message += "4. Review the locking mechanism implementation\n"
+                        
+                          # Send SNS notification if enabled
+                          if send_notification and self.sns_topic_arn:
+                              self.send_sns_notification(
+                                  f"ALERT: Log Export Task Overlaps Detected - {log_group_name}",
+                                  detail_message
+                              )
+                        
+                          return False
+                      else:
+                          logger.info(f"No overlaps found in task history for {log_group_name}")
+                          return True
+                  except Exception as e:
+                      error_msg = f"Error verifying task history: {str(e)}"
+                      logger.error(error_msg)
+                      
+                      # Send notification about the verification error
+                      if send_notification and self.sns_topic_arn:
+                          self.send_sns_notification(
+                              f"ERROR: Log Export Task Verification Failed - {log_group_name}",
+                              f"Failed to verify task history for log group {log_group_name}.\n\nError: {str(e)}\n\nPlease check the Lambda logs for more details."
+                          )
+                    
+                      return False
 
               def wait_for_export_task(self, task_id, log_group_name, current_chunk, total_chunks):
                   """Wait for export task completion with enhanced progress tracking"""
                   start_time = time.time()
                   last_log_time = start_time
                   last_status = None
-                  
+                    
                   while True:
                       try:
                           if (time.time() - start_time) > self.max_wait_time:
                               self.update_export_status(log_group_name, task_id, 'TIMEOUT', current_chunk, total_chunks)
+                              # Update task history with timeout status
+                              self.record_task_execution(log_group_name, task_id, 0, 0, 'TIMEOUT')
                               raise TimeoutError(f"Export task {task_id} exceeded maximum wait time of 12 hours")
 
                           response = self.check_export_task_status(task_id)
                           task = response['exportTasks'][0]
                           status = task['status']['code']
                           
+                          # Get the actual from_time and to_time from the task
+                          from_time = task.get('from', 0)
+                          to_time = task.get('to', 0)
+                            
                           # Only update status if it changed or 5 minutes passed
                           current_time = time.time()
                           if status != last_status or (current_time - last_log_time) >= 300:
                               self.update_export_status(log_group_name, task_id, status, current_chunk, total_chunks)
                               last_status = status
                               last_log_time = current_time
-                          
+                            
                           if status == 'COMPLETED':
                               logger.info(f"Export task {task_id} completed successfully")
+                              # Update task history with completed status
+                              self.record_task_execution(log_group_name, task_id, from_time, to_time, 'COMPLETED')
                               return True
                           elif status in ['FAILED', 'CANCELLED']:
                               error_message = task['status'].get('message', 'No error message provided')
                               logger.error(f"Export task {task_id} failed: {error_message}")
+                              # Update task history with failed status
+                              self.record_task_execution(log_group_name, task_id, from_time, to_time, 'FAILED')
                               return False
-                          
+                            
                           time.sleep(60)  # Check every minute
-                          
+                            
                       except Exception as e:
                           logger.error(f"Error checking task status: {str(e)}")
                           time.sleep(60)  # Wait before retrying
 
               def create_export_task(self, log_group_name, from_time, to_time):
-                  """Create export task with retry logic"""
-                  def create_task():
-                      return logs_client.create_export_task(
-                          logGroupName=log_group_name,
-                          fromTime=from_time,
-                          to=to_time,
-                          destination=self.destination_bucket,
-                          destinationPrefix=f"{log_group_name.strip('/')}/{datetime.fromtimestamp(from_time/1000).strftime('%Y/%m/%d')}"
-                      )
-                  
+                  """Create export task with retry logic and non-overlapping time ranges"""
+                  # Lock parameter name for this log group
+                  lock_parameter_name = f"/cloudwatch/export-lock/{log_group_name.replace('/', '-')}"
+                  last_export_param_name = f"/cloudwatch/last-export/{log_group_name.replace('/', '-')}"
+                
+                  # Try to acquire the lock
+                  if not self.check_and_acquire_lock(lock_parameter_name):
+                      logger.info(f"Another export task is already running for {log_group_name}, skipping")
+                      return None
+                
                   try:
-                      return self.retry_with_backoff(create_task)
+                      # Get the last export time
+                      last_export_time = self.get_last_export_time(last_export_param_name)
+                     
+                      # Ensure from_time is after the last export time
+                      if from_time <= last_export_time:
+                          logger.info(f"Adjusting from_time to avoid overlap with previous export")
+                          from_time = last_export_time + 1
+                    
+                      # Ensure to_time is after from_time
+                      if to_time <= from_time:
+                          logger.info(f"to_time {to_time} is not after from_time {from_time}, skipping export")
+                          return None
+                    
+                      logger.info(f"Creating export task for {log_group_name} from {from_time} to {to_time}")
+                     
+                      def create_task():
+                          return logs_client.create_export_task(
+                              logGroupName=log_group_name,
+                              fromTime=from_time,
+                              to=to_time,
+                              destination=self.destination_bucket,
+                              destinationPrefix=f"{log_group_name.strip('/')}/{datetime.fromtimestamp(from_time/1000).strftime('%Y/%m/%d')}"
+                          )
+                    
+                      response = self.retry_with_backoff(create_task)
+                    
+                      # Update the last export time to the to_time of this export
+                      self.update_last_export_time(last_export_param_name, to_time)
+                    
+                      return response
                   except Exception as e:
                       logger.error(f"Error creating export task: {str(e)}")
                       raise
+                  finally:
+                      # Always release the lock when done
+                      self.release_lock(lock_parameter_name)
 
               def check_export_task_status(self, task_id):
                   """Check export task status with retry logic"""
@@ -502,9 +771,22 @@ Resources:
                   except Exception as e:
                       logger.error(f"Error checking existing export tasks: {str(e)}")
                       return False
+            
+              def get_log_group_retention(self, log_group_name):
+                  """Get the retention period of a log group in days"""
+                  try:
+                      response = logs_client.describe_log_groups(
+                          logGroupNamePrefix=log_group_name,
+                          limit=1
+                      )
+                      retention_in_days = response['logGroups'][0].get('retentionInDays', None)
+                      return retention_in_days
+                  except Exception as e:
+                      logger.error(f"Error getting retention period for log group {log_group_name}: {str(e)}")
+                      return None
 
               def export_log_group(self, log_group_name):
-                  """Export a single log group with progress tracking"""
+                  """Export a single log group with progress tracking and retention period handling"""
                   try:
                       # Reset task start time for new export
                       self.current_task_start_time = None
@@ -518,6 +800,17 @@ Resources:
                           )
                           return False
 
+                      # Get retention period first
+                      retention_days = self.get_log_group_retention(log_group_name)
+                      current_time = int(time.time() * 1000)
+
+                      # Adjust chunk size based on retention period
+                      if retention_days and self.chunk_days > retention_days:
+                          logger.info(f"Adjusting chunk size from {self.chunk_days} to {retention_days} days to match retention period")
+                          chunk_size = retention_days * 24 * 60 * 60 * 1000
+                      else:
+                          chunk_size = self.chunk_days * 24 * 60 * 60 * 1000
+
                       # Get last export time
                       last_export_param = self.get_ssm_parameter_name(log_group_name, 'last-export')
                       try:
@@ -530,17 +823,31 @@ Resources:
                                   logGroupNamePrefix=log_group_name,
                                   limit=1
                               )
-                              last_export_time = response['logGroups'][0]['creationTime']
+                              creation_time = response['logGroups'][0]['creationTime']
+                
+                              if retention_days:
+                                  # Use the later of creation time or retention-limited time
+                                  retention_limited_time = current_time - (retention_days * 24 * 60 * 60 * 1000)
+                                  last_export_time = max(creation_time, retention_limited_time)
+                              else:
+                                  last_export_time = creation_time
                           else:
                               raise
 
-                      current_time = int(time.time() * 1000)
+                      # Ensure we don't exceed retention period if it exists
+                      if retention_days:
+                          earliest_allowed_time = current_time - (retention_days * 24 * 60 * 60 * 1000)
+                          if last_export_time < earliest_allowed_time:
+                              logger.info(f"Adjusting start time to match retention period of {retention_days} days")
+                              last_export_time = earliest_allowed_time
+
                       chunk_size = self.chunk_days * 24 * 60 * 60 * 1000
                       total_chunks = ((current_time - last_export_time) // chunk_size) + 1
 
                       logger.info(f"Starting export for {log_group_name}")
                       logger.info(f"Time range: {datetime.fromtimestamp(last_export_time/1000)} to "
-                                f"{datetime.fromtimestamp(current_time/1000)}")
+                              f"{datetime.fromtimestamp(current_time/1000)}")
+                      logger.info(f"Retention period: {retention_days if retention_days else 'infinite'} days")
                       logger.info(f"Total chunks to process: {total_chunks}")
 
                       # Initialize progress
@@ -550,7 +857,9 @@ Resources:
                           'totalChunks': total_chunks,
                           'startTime': last_export_time,
                           'endTime': current_time,
-                          'lastUpdated': int(time.time() * 1000)
+                          'lastUpdated': int(time.time() * 1000),
+                          'retentionDays': retention_days,
+                          'chunkSizeDays': chunk_size/(24*60*60*1000)
                       })
 
                       start_time = last_export_time
@@ -595,7 +904,8 @@ Resources:
                           'startTime': last_export_time,
                           'endTime': current_time,
                           'lastUpdated': int(time.time() * 1000),
-                          'percentage': 100
+                          'percentage': 100,
+                          'retentionDays': retention_days
                       })
 
                       # Add summary at completion
@@ -605,6 +915,7 @@ Resources:
                           f"├─ Total Chunks Processed: {chunks_processed}\n"
                           f"├─ Time Range: {datetime.fromtimestamp(last_export_time/1000)} to "
                           f"{datetime.fromtimestamp(current_time/1000)}\n"
+                          f"├─ Retention Period: {retention_days if retention_days else 'infinite'} days\n"
                           f"├─ Total Duration: {int(total_time/60)} minutes {int(total_time%60)} seconds\n"
                           f"└─ Average Time per Chunk: {(total_time/chunks_processed/60):.1f} minutes"
                       )
@@ -632,7 +943,8 @@ Resources:
                           'error': str(e),
                           'currentChunk': chunks_processed,
                           'totalChunks': total_chunks,
-                          'lastUpdated': int(time.time() * 1000)
+                          'lastUpdated': int(time.time() * 1000),
+                          'retentionDays': retention_days
                       })
                       
                       self.send_sns_notification(
@@ -708,12 +1020,16 @@ Resources:
                   export_tag_value = event.get('export_tag_value', 'true')
                   chunk_days = event.get('chunk_days', 7)
 
+                  # Check if this is a verification-only run
+                  verification_only = event.get('verification_only', False)
+
                   exporter = LogExporter(
                       destination_bucket,
                       sns_topic_arn,
                       export_tag_key,
                       export_tag_value,
-                      chunk_days
+                      chunk_days,
+                      context
                   )
                   
                   tagged_groups = exporter.get_tagged_log_groups()
@@ -725,30 +1041,81 @@ Resources:
                           'body': 'No tagged log groups found'
                       }
                   
+                  # If this is a verification-only run, just check for overlaps
+                  if verification_only:
+                      verification_results = {}
+                      overlap_count = 0
+                    
+                      for log_group_name in tagged_groups:
+                          is_valid = exporter.verify_task_history(log_group_name, send_notification=True)
+                          verification_results[log_group_name] = is_valid
+                          if not is_valid:
+                              overlap_count += 1
+                    
+                      # Send a summary notification if overlaps were found
+                      if overlap_count > 0 and sns_topic_arn:
+                          exporter.send_sns_notification(
+                              f"Log Export Task Verification Summary - {overlap_count} Log Groups with Overlaps",
+                              f"Detected overlaps in {overlap_count} out of {len(tagged_groups)} log groups.\n\n"
+                              f"Please check individual notifications for details or review the Lambda logs."
+                          )
+                    
+                      return {
+                          'statusCode': 200,
+                          'body': json.dumps({
+                              'verification_results': verification_results,
+                              'overlap_count': overlap_count
+                          })
+                      }
+
                   results = {}
+                  verification_results = {}
+                
+                  # First verify all log groups for overlaps
+                  for log_group_name in tagged_groups:
+                      verification_results[log_group_name] = exporter.verify_task_history(log_group_name)
+                
+                  # Then process each log group
                   for log_group_name in tagged_groups:
                       success = exporter.export_log_group(log_group_name)
                       results[log_group_name] = {
                           'success': success,
                           'summary': exporter.get_export_summary(log_group_name)
                       }
-
+                
+                  # Verify again after processing
+                  post_verification = {}
+                  for log_group_name in tagged_groups:
+                      post_verification[log_group_name] = exporter.verify_task_history(log_group_name)
+                
                   return {
                       'statusCode': 200,
                       'body': json.dumps({
-                          'message': 'Export process completed',
-                          'results': results
+                          'results': results,
+                          'preVerification': verification_results,
+                          'postVerification': post_verification
                       })
                   }
-                  
               except Exception as e:
-                  error_msg = f"Export process failed: {str(e)}"
+                  error_msg = f"Error in lambda_handler: {str(e)}"
                   logger.error(error_msg)
+                
+                  # Send notification about the error
+                  try:
+                      sns_topic_arn = event.get('sns_topic_arn')
+                      if sns_topic_arn:
+                          sns_client.publish(
+                              TopicArn=sns_topic_arn,
+                              Subject=f"ERROR: Log Export Lambda Failure",
+                              Message=f"The Log Export Lambda function encountered an error:\n\n{error_msg}\n\nPlease check the Lambda logs for more details."
+                          )
+                  except Exception as sns_error:
+                      logger.error(f"Failed to send error notification: {str(sns_error)}")
+                
                   return {
                       'statusCode': 500,
-                      'body': json.dumps({'error': error_msg})
+                      'body': f"Error: {str(e)}"
                   }
-
 
   LogExporterLogGroup:
     Type: AWS::Logs::LogGroup
